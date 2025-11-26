@@ -1,4 +1,3 @@
-# seq2seq_paper_replica.py
 import os
 import math
 import random
@@ -14,9 +13,8 @@ torch.backends.cudnn.benchmark = True
 print(torch.cuda.is_available())
 print(torch.cuda.get_device_name(0))
 
-# -------------------------
 # Hyperparameters (paper-like)
-# -------------------------
+
 
 EMBED_SIZE = 256       # from 1000 → 256  
 HIDDEN_SIZE = 256      # from 1000 → 256  
@@ -27,20 +25,21 @@ BATCH_SIZE = 128        # if still OOM → use 8
 # EMBED_SIZE = 1000
 # HIDDEN_SIZE = 1000
 # NUM_LAYERS = 4          # paper used deep LSTMs (4)
-# BATCH_SIZE = 8
-VOCAB_SIZE = None       # set later from vocab.txt
-LEARNING_RATE = 0.3     # paper used SGD with high lr
-CLIP = 5.0
-MAX_EPOCHS = 25          # paper's regime; monitor val
+# BATCH_SIZE = 128
+
+VOCAB_SIZE = None       
+LEARNING_RATE = 0.3     # paper used SGD with high lr=0.7
+CLIP = 5.0              # same clip used
+MAX_EPOCHS = 25          # not mentioned in the paper
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BEAM_SIZE = 3          # paper used large beam when decoding
+BEAM_SIZE = 3          # in paper beam size was 12
 
 print("Using device:", DEVICE)
 print(f"Hyperparams: embed_size={EMBED_SIZE}, hidden_size={HIDDEN_SIZE}, num_layers={NUM_LAYERS}, batch_size={BATCH_SIZE}, learning_rate={LEARNING_RATE}")
 
-# -------------------------
+
 # Utilities: read files
-# -------------------------
+
 def read_id_file(path: str) -> List[List[int]]:
     sents = []
     with open(path, "r", encoding="utf8") as f:
@@ -62,9 +61,9 @@ def load_vocab(vocab_path: str) -> Tuple[dict, dict]:
     print(f"Loaded vocabulary of size {len(idx2word)} from {vocab_path}")
     return word2idx, idx2word
 
-# -------------------------
+
 # Dataset + collate
-# -------------------------
+
 class IDsDataset(Dataset):
     def __init__(self, src_file, tgt_file):
         self.src = read_id_file(src_file)
@@ -78,30 +77,25 @@ PAD = 0
 EOS = 2
 
 def collate_fn(batch):
-    # batch: list of (src_ids_tensor, tgt_ids_tensor)
     src_list, tgt_list = zip(*batch)
-    # pad (they are already reversed source if you did preprocessing)
-    # We will left-pad? common is right-pad; use right-pad.
-    src_padded = pad_sequence(src_list, batch_first=True, padding_value=PAD)  # (B, Lsrc)
-    tgt_padded = pad_sequence(tgt_list, batch_first=True, padding_value=PAD)  # (B, Ltgt)
-    # create masks (1 for real, 0 for pad)
-    src_mask = (src_padded != PAD).to(torch.float32)  # (B, Lsrc)
+    src_padded = pad_sequence(src_list, batch_first=True, padding_value=PAD) 
+    tgt_padded = pad_sequence(tgt_list, batch_first=True, padding_value=PAD)  
+    src_mask = (src_padded != PAD).to(torch.float32)  
     tgt_mask = (tgt_padded != PAD).to(torch.float32)
     return src_padded, src_mask, tgt_padded, tgt_mask
 
-# -------------------------
-# Encoder / Decoder (paper-style LSTMs)
-# -------------------------
+
+# Encoder / Decoder 
+
 class Encoder(nn.Module):
     def __init__(self, vocab_size, embed_size, hidden_size, num_layers):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_size, padding_idx=PAD)
         self.lstm = nn.LSTM(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
+
     def forward(self, src, src_mask):
-        # src: (B, L)
-        emb = self.embed(src)  # (B, L, E)
-        outputs, (h_n, c_n) = self.lstm(emb)  # h_n: (num_layers, B, H)
-        # We return final hidden state (h_n, c_n) for decoder init
+        emb = self.embed(src) 
+        outputs, (h_n, c_n) = self.lstm(emb) 
         return outputs, (h_n, c_n)
 
 class Decoder(nn.Module):
@@ -109,17 +103,17 @@ class Decoder(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_size, padding_idx=PAD)
         self.lstm = nn.LSTM(embed_size, hidden_size, num_layers=num_layers, batch_first=True)
-        self.out = nn.Linear(hidden_size, vocab_size)  # deep output in later works; plain linear here
+        self.out = nn.Linear(hidden_size, vocab_size)  
     def forward(self, tgt_input, hidden):
-        # tgt_input: (B, T) token ids (teacher forcing input)
+        
         emb = self.embed(tgt_input)
-        outputs, hidden = self.lstm(emb, hidden)  # outputs: (B, T, H)
-        logits = self.out(outputs)  # (B, T, V)
+        outputs, hidden = self.lstm(emb, hidden) 
+        logits = self.out(outputs)  
         return logits, hidden
 
-# -------------------------
+
 # Training utilities
-# -------------------------
+
 def sequence_loss(logits, targets, pad_idx=PAD):
     B, T, V = logits.shape
     logits_flat = logits.reshape(B*T, V)
@@ -128,36 +122,32 @@ def sequence_loss(logits, targets, pad_idx=PAD):
     return loss(logits_flat, targets_flat) / B
 
 
-# -------------------------
-# Simple greedy and beam decoder (for eval)
-# -------------------------
+# Simple greedy and beam decoder 
+
 def greedy_decode(encoder, decoder, src, src_mask, max_len=100):
     encoder.eval(); decoder.eval()
     with torch.no_grad():
         _, (h_n, c_n) = encoder(src, src_mask)
         B = src.size(0)
-        # start decoding from <eos> or from some <sos>? Paper used <eos> handling; typical: feed <eos> or start token.
-        # We'll start with <eos> token as first input for each example (paper appended eos then decoder predicted tokens until eos)
         cur = torch.full((B,1), EOS, dtype=torch.long, device=src.device)
         hidden = (h_n, c_n)
         outputs = []
         for _ in range(max_len):
-            logits, hidden = decoder(cur, hidden)  # logits: (B, 1, V)
-            probs = torch.softmax(logits[:, -1, :], dim=-1)  # (B, V)
-            next_tok = torch.argmax(probs, dim=-1, keepdim=True)  # (B,1)
+            logits, hidden = decoder(cur, hidden)  
+            probs = torch.softmax(logits[:, -1, :], dim=-1)  
+            next_tok = torch.argmax(probs, dim=-1, keepdim=True) 
             outputs.append(next_tok)
             cur = next_tok
-        outputs = torch.cat(outputs, dim=1)  # (B, L)
+        outputs = torch.cat(outputs, dim=1) 
         return outputs.cpu().tolist()
 
-# (Optional) beam search (simplified - single batch only)
+
 import heapq
 def beam_search_single_example(encoder, decoder, src1, src_mask1, beam_size=BEAM_SIZE, max_len=100):
-    # src1: (1, L)
     encoder.eval(); decoder.eval()
     with torch.no_grad():
         _, (h_n, c_n) = encoder(src1, src_mask1)
-        # Each beam: ( -score, tokens_list, hidden_states )
+
         beams = [ (0.0, [EOS], (h_n, c_n)) ]  # start with eos
         completed = []
         for _ in range(max_len):
@@ -165,7 +155,7 @@ def beam_search_single_example(encoder, decoder, src1, src_mask1, beam_size=BEAM
             for score, tokens, hidden in beams:
                 last_tok = torch.tensor([[tokens[-1]]], device=src1.device)
                 logits, new_hidden = decoder(last_tok, hidden)
-                logp = torch.log_softmax(logits[0,-1,:], dim=-1)  # (V,)
+                logp = torch.log_softmax(logits[0,-1,:], dim=-1)  
                 topk = torch.topk(logp, k=beam_size)
                 for k in range(beam_size):
                     nt = int(topk.indices[k].item())
@@ -185,9 +175,8 @@ def beam_search_single_example(encoder, decoder, src1, src_mask1, beam_size=BEAM
         else:
             return beams[0][1]
 
-# -------------------------
 # Training loop
-# -------------------------
+
 def train(train_loader, val_loader, vocab_size, save_dir="checkpoints"):
     encoder = Encoder(vocab_size, EMBED_SIZE, HIDDEN_SIZE, NUM_LAYERS).to(DEVICE)
     decoder = Decoder(vocab_size, EMBED_SIZE, HIDDEN_SIZE, NUM_LAYERS).to(DEVICE)
@@ -234,7 +223,7 @@ def train(train_loader, val_loader, vocab_size, save_dir="checkpoints"):
 
         avg_train_loss = total_loss / max(1, total_batches)
 
-        # ===== validation =====
+        #validation
         encoder.eval(); decoder.eval()
         val_loss = 0.0; val_batches = 0
 
@@ -272,9 +261,8 @@ def train(train_loader, val_loader, vocab_size, save_dir="checkpoints"):
     return encoder, decoder
 
 
-# -------------------------
 # Entrypoint: load data and kick off training
-# -------------------------
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
